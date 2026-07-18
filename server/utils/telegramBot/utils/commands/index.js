@@ -93,6 +93,15 @@ const BOT_COMMANDS = [
   },
   {
     ...BASE_COMMAND,
+    command: "vault",
+    description: "Save an insight to your vault (e.g. /vault my note)",
+    initHandler: () => {
+      const { handleVault } = require("./handlers/handleVault");
+      return handleVault;
+    },
+  },
+  {
+    ...BASE_COMMAND,
     command: "help",
     description: "Show available commands",
     initHandler: () => {
