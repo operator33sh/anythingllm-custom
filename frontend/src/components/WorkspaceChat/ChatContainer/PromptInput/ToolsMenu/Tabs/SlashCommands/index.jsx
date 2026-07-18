@@ -57,6 +57,12 @@ export default function SlashCommandsTab({
         description: t("chat_window.preset_reset_description"),
         autoSubmit: true,
       },
+      {
+        command: "/vault",
+        description:
+          "Sla het inzicht (of de tekst erachter) op in je vault",
+        autoSubmit: false,
+      },
       ...presets.map((preset) => ({
         command: preset.command,
         description: preset.description,
