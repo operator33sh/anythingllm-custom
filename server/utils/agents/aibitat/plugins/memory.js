@@ -19,7 +19,7 @@ const memory = {
           tracker: new Deduplicator(),
           name: this.name,
           description:
-            "Search your local documents and workspace files for relevant information, or store information to long-term memory. Use search to find answers in uploaded documents, embedded files, or previously stored memories. Use store only when explicitly asked to remember or save something.",
+            "Search your local documents and workspace files for relevant information, store information to long-term memory, delete a specific memory, or update (replace) an existing memory. Use search to find answers. Use store only when explicitly asked to remember or save something. Use delete when asked to forget or remove a specific memory. Use update when asked to correct or replace an existing memory.",
           examples: [
             {
               prompt: "Check my files for information about the project",
@@ -29,17 +29,25 @@ const memory = {
               }),
             },
             {
-              prompt: "What do you know about Plato's motives?",
-              call: JSON.stringify({
-                action: "search",
-                content: "What are the facts about Plato's motives?",
-              }),
-            },
-            {
               prompt: "Remember that you are a robot",
               call: JSON.stringify({
                 action: "store",
                 content: "I am a robot, the user told me that i am.",
+              }),
+            },
+            {
+              prompt: "Forget that I said I am a robot",
+              call: JSON.stringify({
+                action: "delete",
+                content: "I am a robot",
+              }),
+            },
+            {
+              prompt: "Correct my preference: I prefer tea, not coffee",
+              call: JSON.stringify({
+                action: "update",
+                content: "I prefer coffee",
+                newContent: "I prefer tea",
               }),
             },
           ],
@@ -49,32 +57,40 @@ const memory = {
             properties: {
               action: {
                 type: "string",
-                enum: ["search", "store"],
+                enum: ["search", "store", "delete", "update"],
                 description:
-                  "The action we want to take to search for existing similar context or storage of new context.",
+                  "The action to perform: search existing context, store new context, delete a specific memory by similarity match, or update (replace) an existing memory.",
               },
               content: {
                 type: "string",
                 description:
-                  "The plain text to search our local documents with or to store in our vector database.",
+                  "The plain text to search, store, or — for delete/update — the existing memory content to find and remove.",
+              },
+              newContent: {
+                type: "string",
+                description:
+                  "Required for the 'update' action only. The replacement text that will be stored after the old content is deleted.",
               },
             },
+            required: ["action", "content"],
             additionalProperties: false,
           },
-          handler: async function ({ action = "", content = "" }) {
+          handler: async function ({ action = "", content = "", newContent = "" }) {
             try {
-              const { isDuplicate } = this.tracker.isDuplicate(this.name, {
-                action,
-                content,
-              });
+              const dedupeKey = action === "update"
+                ? { action, content, newContent }
+                : { action, content };
+              const { isDuplicate } = this.tracker.isDuplicate(this.name, dedupeKey);
               if (isDuplicate)
                 return `This was a duplicated call and it's output will be ignored.`;
 
               let response = "There was nothing to do.";
               if (action === "search") response = await this.search(content);
               if (action === "store") response = await this.store(content);
+              if (action === "delete") response = await this.delete(content);
+              if (action === "update") response = await this.update(content, newContent);
 
-              this.tracker.trackRun(this.name, { action, content });
+              this.tracker.trackRun(this.name, dedupeKey);
               return response;
             } catch (error) {
               console.log(error);
@@ -157,6 +173,66 @@ const memory = {
               );
               return `Let the user know this action was not successful. An error was raised while storing data in the vector database. ${error.message}`;
             }
+          },
+          delete: async function (query = "") {
+            try {
+              const workspace = this.super.handlerProps.invocation.workspace;
+              const { connector: LLMConnector } =
+                await resolveProviderConnector({ workspace, prompt: query });
+              const vectorDB = getVectorDbClass();
+
+              // Find the most similar stored memory
+              const { sources } = await vectorDB.performSimilaritySearch({
+                namespace: workspace.slug,
+                input: query,
+                LLMConnector,
+                topN: 1,
+                rerank: false,
+              });
+
+              if (!sources || sources.length === 0) {
+                return "No matching memory found to delete.";
+              }
+
+              // curateSources flattens metadata so top-level `id` is the vectorId
+              const vectorId = sources[0]?.id;
+              if (!vectorId) {
+                return "Could not identify the memory record to delete.";
+              }
+
+              const { DocumentVectors } = require("../../../../models/vectors");
+              const records = await DocumentVectors.where({ vectorId });
+              if (!records || records.length === 0) {
+                return "Could not find the memory record in the database.";
+              }
+
+              const docId = records[0].docId;
+              await vectorDB.deleteDocumentFromNamespace(workspace.slug, docId);
+
+              this.super.introspect(
+                `${this.caller}: I deleted a memory from the vector database (docId: ${docId}).`
+              );
+              return "The specified memory was successfully deleted from the vector database.";
+            } catch (error) {
+              this.super.handlerProps.log(
+                `memory.delete raised an error. ${error.message}`
+              );
+              return `An error was raised while deleting from the vector database. ${error.message}`;
+            }
+          },
+          update: async function (oldContent = "", newContent = "") {
+            if (!newContent || !newContent.trim()) {
+              return "Update requires newContent. Please provide the replacement text.";
+            }
+            // Delete the old memory, then store the new one
+            const deleteResult = await this.delete(oldContent);
+            if (deleteResult.includes("error") || deleteResult.includes("No matching")) {
+              this.super.introspect(
+                `${this.caller}: Could not find old memory to replace — storing the new version anyway.`
+              );
+            }
+            const storeResult = await this.store(newContent);
+            return `Memory updated. ${deleteResult} → ${storeResult}`;
           },
         });
       },

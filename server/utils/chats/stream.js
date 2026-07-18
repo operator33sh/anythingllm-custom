@@ -89,9 +89,9 @@ async function streamChatWithWorkspace(
   const hasVectorizedSpace = await VectorDb.hasNamespace(workspace.slug);
   const embeddingsCount = await VectorDb.namespaceCount(workspace.slug);
 
-  // User is trying to query-mode chat a workspace that has no data in it - so
-  // we should exit early as no information can be found under these conditions.
-  if ((!hasVectorizedSpace || embeddingsCount === 0) && chatMode === "query") {
+  // User is trying to query-mode chat a workspace that has no vector namespace at all.
+  // With the synthesis pipeline we only exit early when the namespace does not exist.
+  if (!hasVectorizedSpace && chatMode === "query") {
     const textResponse =
       workspace?.queryRefusalResponse ??
       "There is no relevant information in this workspace to answer your query.";
@@ -174,35 +174,36 @@ async function streamChatWithWorkspace(
     });
   });
 
-  const vectorSearchResults =
-    embeddingsCount !== 0
-      ? await VectorDb.performSimilaritySearch({
-          namespace: workspace.slug,
-          input: updatedMessage,
-          LLMConnector,
-          similarityThreshold: workspace?.similarityThreshold,
-          topN: workspace?.topN,
-          filterIdentifiers: pinnedDocIdentifiers,
-          rerank: workspace?.vectorSearchMode === "rerank",
-        })
-      : {
-          contextTexts: [],
-          sources: [],
-          message: null,
-        };
-
-  // Failed similarity search if it was run at all and failed.
-  if (!!vectorSearchResults.message) {
-    writeResponseChunk(response, {
-      id: uuid,
-      type: "abort",
-      textResponse: null,
-      sources: [],
-      close: true,
-      error: vectorSearchResults.message,
-    });
-    return;
+  // ── STAP 1: Directe LanceDB query ──────────────────────────────────────────
+  // Altijd uitvoeren wanneer de namespace bestaat, ongeacht chatMode.
+  // Soft-fail zodat de pipeline doorgaat bij een lege/kapotte namespace.
+  let vectorSearchResults = { contextTexts: [], sources: [], message: null };
+  if (hasVectorizedSpace) {
+    try {
+      const result = await VectorDb.performSimilaritySearch({
+        namespace: workspace.slug,
+        input: updatedMessage,
+        LLMConnector,
+        similarityThreshold: workspace?.similarityThreshold,
+        topN: workspace?.topN,
+        filterIdentifiers: pinnedDocIdentifiers,
+        rerank: workspace?.vectorSearchMode === "rerank",
+      });
+      if (result.message) {
+        console.warn(`[SYNTHESIS:VAULT] Vector search warning: ${result.message}`);
+      } else {
+        vectorSearchResults = result;
+      }
+    } catch (e) {
+      console.warn(`[SYNTHESIS:VAULT] Vector search error: ${e.message}`);
+    }
   }
+
+  console.log(`[SYNTHESIS:VAULT] Query: "${updatedMessage.slice(0, 100)}"`);
+  console.log(`[SYNTHESIS:VAULT] Gevonden chunks: ${vectorSearchResults.contextTexts.length}`);
+  vectorSearchResults.contextTexts.forEach((t, i) =>
+    console.log(`[SYNTHESIS:VAULT] Chunk ${i + 1}: "${t.slice(0, 200)}..."`)
+  );
 
   const { fillSourceWindow } = require("../helpers/chat");
   const filledSources = fillSourceWindow({
@@ -211,78 +212,75 @@ async function streamChatWithWorkspace(
     history: rawHistory,
     filterIdentifiers: pinnedDocIdentifiers,
   });
-
-  // Why does contextTexts get all the info, but sources only get current search?
-  // This is to give the ability of the LLM to "comprehend" a contextual response without
-  // populating the Citations under a response with documents the user "thinks" are irrelevant
-  // due to how we manage backfilling of the context to keep chats with the LLM more correct in responses.
-  // If a past citation was used to answer the question - that is visible in the history so it logically makes sense
-  // and does not appear to the user that a new response used information that is otherwise irrelevant for a given prompt.
-  // TLDR; reduces GitHub issues for "LLM citing document that has no answer in it" while keep answers highly accurate.
-  contextTexts = [...contextTexts, ...filledSources.contextTexts];
   sources = [...sources, ...vectorSearchResults.sources];
 
-  // If in query mode and no context chunks are found from search, backfill, or pins -  do not
-  // let the LLM try to hallucinate a response or use general knowledge and exit early
-  if (chatMode === "query" && contextTexts.length === 0) {
-    const textResponse =
-      workspace?.queryRefusalResponse ??
-      "There is no relevant information in this workspace to answer your query.";
-    writeResponseChunk(response, {
-      id: uuid,
-      type: "textResponse",
-      textResponse,
-      sources: [],
-      close: true,
-      error: null,
-    });
-
-    await WorkspaceChats.new({
-      workspaceId: workspace.id,
-      prompt: message,
-      response: {
-        text: textResponse,
-        sources: [],
-        type: chatMode,
-        attachments,
-      },
-      threadId: thread?.id || null,
-      include: false,
-      user,
-    });
-    return;
-  }
-
-  // Compress & Assemble message to ensure prompt passes token limit with room for response
-  // and build system messages based on inputs and history.
-  // Reuse the system prompt from routing pre-fetch when available.
-  const systemPrompt =
+  // Base system prompt (hergebruik van pre-fetch wanneer beschikbaar).
+  const baseSystemPrompt =
     prefetchedContext?.systemPrompt ??
     (await chatPrompt(workspace, user, {
       prompt: updatedMessage,
       rawHistory,
     }));
-  const messages = await LLMConnector.compressMessages(
+
+  // ── STAP 2: Ruwe LLM-call zonder vault-context ──────────────────────────────
+  // Pinned docs en parsed files gaan wel mee (contextTexts), vault-chunks niet.
+  // Dit geeft de "eigen redenering" van de LLM als baseline voor de synthese.
+  const rawMessages = await LLMConnector.compressMessages(
     {
-      systemPrompt,
+      systemPrompt: baseSystemPrompt,
       userPrompt: updatedMessage,
-      contextTexts,
+      contextTexts,   // pinned docs + parsed files, géén vault search results
       chatHistory,
       attachments,
     },
     rawHistory
   );
 
-  // If streaming is not explicitly enabled for connector
-  // we do regular waiting of a response and send a single chunk.
+  const { textResponse: llmDraft } = await LLMConnector.getChatCompletion(
+    rawMessages,
+    {
+      temperature: workspace?.openAiTemp ?? LLMConnector.defaultTemp,
+      user,
+    }
+  );
+
+  console.log(
+    `[SYNTHESIS:LLM] Ruw LLM-antwoord (geen vault-context): "${(llmDraft ?? "").slice(0, 500)}..."`
+  );
+
+  // ── STAP 3: Synthese-call — vault + LLM-draft → finaal antwoord ─────────────
+  const vaultTexts = filledSources.contextTexts;
+  const vaultSection =
+    vaultTexts.length > 0
+      ? vaultTexts.map((t, i) => `[${i + 1}] ${t.trim()}`).join("\n\n")
+      : "Geen relevante vault-context gevonden voor deze query.";
+
+  const synthesisSystemPrompt =
+    `${baseSystemPrompt}\n\n` +
+    `Je bent een synthese-engine. Je ontvangt twee bronnen:\n\n` +
+    `[Kennis uit Vault]\n${vaultSection}\n[/Kennis uit Vault]\n\n` +
+    `[Initieel LLM Antwoord]\n${llmDraft ?? ""}\n[/Initieel LLM Antwoord]\n\n` +
+    `Formuleer een finaal antwoord waarbij de Vault als primaire bron dient. ` +
+    `Gebruik het initieel LLM-antwoord als context en contrast. ` +
+    `Als Vault en LLM-antwoord tegenstrijdig zijn, benoem dit expliciet en geef prioriteit aan de Vault.`;
+
+  // Enkelvoudige 2-bericht array voor de synthesestap (geen history-compressie nodig).
+  const synthesisMessages = [
+    { role: "system", content: synthesisSystemPrompt },
+    { role: "user",   content: updatedMessage },
+  ];
+
+  console.log(`[SYNTHESIS:FINAL] Synthese-prompt verstuurd naar LLM...`);
+
+  // Streaming of non-streaming afhankelijk van de connector.
   if (LLMConnector.streamingEnabled() !== true) {
     console.log(
       `\x1b[31m[STREAMING DISABLED]\x1b[0m Streaming is not available for ${LLMConnector.constructor.name}. Will use regular chat method.`
     );
     const { textResponse, metrics: performanceMetrics } =
-      await LLMConnector.getChatCompletion(messages, {
+      await LLMConnector.getChatCompletion(synthesisMessages, {
         temperature: workspace?.openAiTemp ?? LLMConnector.defaultTemp,
-        user: user,
+        user,
       });
 
     completeText = textResponse;
@@ -297,9 +295,9 @@ async function streamChatWithWorkspace(
       metrics,
     });
   } else {
-    const stream = await LLMConnector.streamGetChatCompletion(messages, {
+    const stream = await LLMConnector.streamGetChatCompletion(synthesisMessages, {
       temperature: workspace?.openAiTemp ?? LLMConnector.defaultTemp,
-      user: user,
+      user,
     });
     completeText = await LLMConnector.handleStream(response, stream, {
       uuid,

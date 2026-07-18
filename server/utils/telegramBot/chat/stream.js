@@ -112,6 +112,7 @@ async function streamResponse({
     pinnedDocIdentifiers,
   } = await collectPinnedDocs(workspace, LLMConnector);
 
+  // ── STAP 1: Directe vault search ─────────────────────────────────────────
   const {
     contextTexts: searchContextTexts,
     sources: searchSources,
@@ -126,28 +127,67 @@ async function streamResponse({
     pinnedDocIdentifiers,
   });
 
+  // Soft-fail: bij een search-fout gaan we door met lege vault-context.
   if (searchError) {
-    clearInterval(typingInterval);
-    return await ctx.bot.sendMessage(chatId, searchError);
+    ctx.log(`[SYNTHESIS:VAULT] Search error (soft-fail): ${searchError}`);
   }
 
-  const contextTexts = [...pinnedContextTexts, ...searchContextTexts];
   const sources = [...pinnedSources, ...searchSources];
-  const messages = await LLMConnector.compressMessages(
+  const baseSystemPrompt = await chatPrompt(workspace);
+
+  ctx.log(`[SYNTHESIS:VAULT] Gevonden chunks: ${searchContextTexts.length}`);
+  searchContextTexts.forEach((t, i) =>
+    ctx.log(`[SYNTHESIS:VAULT] Chunk ${i + 1}: "${t.slice(0, 200)}..."`)
+  );
+
+  // ── STAP 2: Ruwe LLM-call zonder vault-context ───────────────────────────
+  // Pinned docs gaan wel mee, vault search results niet.
+  const rawMessages = await LLMConnector.compressMessages(
     {
-      systemPrompt: await chatPrompt(workspace),
+      systemPrompt: baseSystemPrompt,
       userPrompt: message,
-      contextTexts,
+      contextTexts: pinnedContextTexts,
       chatHistory,
       attachments,
     },
     rawHistory
   );
 
+  const { textResponse: llmDraft } = await LLMConnector.getChatCompletion(
+    rawMessages,
+    { temperature: workspace?.openAiTemp ?? LLMConnector.defaultTemp }
+  );
+
+  ctx.log(
+    `[SYNTHESIS:LLM] Ruw LLM-antwoord: "${(llmDraft ?? "").slice(0, 300)}..."`
+  );
+
+  // ── STAP 3: Synthese-call ────────────────────────────────────────────────
+  const vaultSection =
+    searchContextTexts.length > 0
+      ? searchContextTexts.map((t, i) => `[${i + 1}] ${t.trim()}`).join("\n\n")
+      : "Geen relevante vault-context gevonden voor deze query.";
+
+  const synthesisSystemPrompt =
+    `${baseSystemPrompt}\n\n` +
+    `Je bent een synthese-engine. Je ontvangt twee bronnen:\n\n` +
+    `[Kennis uit Vault]\n${vaultSection}\n[/Kennis uit Vault]\n\n` +
+    `[Initieel LLM Antwoord]\n${llmDraft ?? ""}\n[/Initieel LLM Antwoord]\n\n` +
+    `Formuleer een finaal antwoord waarbij de Vault als primaire bron dient. ` +
+    `Gebruik het initieel LLM-antwoord als context en contrast. ` +
+    `Als Vault en LLM-antwoord tegenstrijdig zijn, benoem dit expliciet en geef prioriteit aan de Vault.`;
+
+  const synthesisMessages = [
+    { role: "system", content: synthesisSystemPrompt },
+    { role: "user",   content: message },
+  ];
+
+  ctx.log(`[SYNTHESIS:FINAL] Synthese-prompt verstuurd naar LLM...`);
+
   try {
     const { completeText, metrics } = await generateResponse({
       LLMConnector,
-      messages,
+      messages: synthesisMessages,
       workspace,
       ctx,
       chatId,

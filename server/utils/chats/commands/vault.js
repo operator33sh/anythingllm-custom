@@ -1,6 +1,7 @@
 const path = require("path");
+const { v4: uuidv4 } = require("uuid");
 const filesystem = require("../../agents/aibitat/plugins/filesystem/lib.js");
-const { getLLMProvider } = require("../../helpers");
+const { getLLMProvider, getVectorDbClass } = require("../../helpers");
 
 /**
  * Slugify a title into a safe filename fragment.
@@ -175,22 +176,69 @@ async function saveToVault(workspace, message, msgUUID, user = null, thread = nu
   const tagLine = tags.length ? `\n\n${tags.join(" ")}\n` : "";
   const noteContent = `# ${title}\n\n_Opgeslagen op ${formatTimestamp(now)}_\n\n${body}\n${tagLine}`;
 
+  // --- Actie A: Schrijf naar Obsidian (filesystem) ---
+  let fsPath = null;
+  let fsError = null;
   try {
     const validPath = await filesystem.validatePath(filename);
     await filesystem.writeFileContent(validPath, noteContent);
-    const tagConfirm = tags.length ? `\n\n${tags.join(" ")}` : "";
-    return response(
-      msgUUID,
-      `Opgeslagen in de vault: \`${path.basename(validPath)}\`\n\n**${title}**\n\n${body}${tagConfirm}`
-    );
+    fsPath = validPath;
   } catch (e) {
-    console.error(`[/vault] Write failed: ${e.message}`);
+    console.error(`[/vault] Filesystem write failed: ${e.message}`);
+    fsError = e.message;
+  }
+
+  // --- Actie B: Sla op in vector DB (RAG) ---
+  let vectorStored = false;
+  let vectorError = null;
+  try {
+    const vectorDB = getVectorDbClass();
+    await vectorDB.addDocumentToNamespace(
+      workspace.slug,
+      {
+        docId: uuidv4(),
+        id: uuidv4(),
+        url: `vault://obsidian/${filename}`,
+        title: filename,
+        docAuthor: "vault",
+        description: title,
+        docSource: "Opgeslagen via /vault commando",
+        chunkSource: "",
+        published: now.toLocaleString(),
+        wordCount: body.split(" ").length,
+        pageContent: noteContent,
+        token_count_estimate: 0,
+      },
+      null
+    );
+    vectorStored = true;
+  } catch (e) {
+    console.error(`[/vault] Vector store failed: ${e.message}`);
+    vectorError = e.message;
+  }
+
+  // Beide acties gefaald → foutmelding
+  if (fsError && !vectorStored) {
     return response(
       msgUUID,
-      `Kon het inzicht niet opslaan in de vault: ${e.message}`,
+      `Kon het inzicht niet opslaan:\n- Obsidian: ${fsError}\n- Vector DB: ${vectorError}`,
       true
     );
   }
+
+  // Bouw bevestigingsbericht
+  const tagConfirm = tags.length ? `\n\n${tags.join(" ")}` : "";
+  const obsidianStatus = fsPath
+    ? `Obsidian ✓ \`${path.basename(fsPath)}\``
+    : `Obsidian ✗ ${fsError}`;
+  const vectorStatus = vectorStored
+    ? `Vector vault ✓`
+    : `Vector vault ✗ ${vectorError}`;
+
+  return response(
+    msgUUID,
+    `Inzicht gesynchroniseerd naar ${obsidianStatus} en ${vectorStatus}, Architect.\n\n**${title}**\n\n${body}${tagConfirm}`
+  );
 }
 
 module.exports = {
