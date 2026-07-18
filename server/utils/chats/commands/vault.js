@@ -20,6 +20,24 @@ function slugifyTitle(text) {
 }
 
 /**
+ * Normalizes a raw tag into an Obsidian-style `#tag` token.
+ * Strips a leading `#`, lowercases, and replaces unsafe chars with `-`.
+ * @param {string} raw
+ * @returns {string|null}
+ */
+function normalizeTag(raw) {
+  const cleaned = String(raw)
+    .toLowerCase()
+    .trim()
+    .replace(/^#+/, "")
+    .replace(/[^a-z0-9\s_-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return cleaned ? `#${cleaned}` : null;
+}
+
+/**
  * Formats a Date as DD/MM/YYYY HH:MM for the note metadata.
  * @param {Date} date
  * @returns {string}
@@ -103,6 +121,7 @@ async function saveToVault(workspace, message, msgUUID, user = null, thread = nu
   // Ask the workspace LLM to produce a title + a clean markdown summary.
   let title = "Inzicht";
   let body = source;
+  let tags = [];
   try {
     const LLMConnector = getLLMProvider({
       provider: workspace?.chatProvider,
@@ -113,8 +132,9 @@ async function saveToVault(workspace, message, msgUUID, user = null, thread = nu
         role: "system",
         content:
           "Je bent een assistent die inzichten samenvat voor opslag in een Obsidian-vault. " +
-          "Antwoord UITSLUITEND met geldige JSON in de vorm {\"title\": \"...\", \"body\": \"...\"}. " +
+          "Antwoord UITSLUITEND met geldige JSON in de vorm {\"title\": \"...\", \"body\": \"...\", \"tags\": [\"...\"]}. " +
           "De title is kort (max 8 woorden). De body is een heldere markdown-samenvatting van het inzicht. " +
+          "tags is een array van 2 tot 5 relevante thema-trefwoorden (zonder #, enkel woorden, bijv. \"sovereignty\", \"narcism\"). " +
           "Voeg geen extra tekst of codeblokken toe.",
       },
       {
@@ -135,6 +155,11 @@ async function saveToVault(workspace, message, msgUUID, user = null, thread = nu
       const parsed = JSON.parse(match[0]);
       if (parsed.title) title = String(parsed.title).trim();
       if (parsed.body) body = String(parsed.body).trim();
+      if (Array.isArray(parsed.tags)) {
+        tags = parsed.tags
+          .map(normalizeTag)
+          .filter((t, i, arr) => t && arr.indexOf(t) === i);
+      }
     } else if (textResponse?.trim()) {
       body = textResponse.trim();
     }
@@ -147,14 +172,16 @@ async function saveToVault(workspace, message, msgUUID, user = null, thread = nu
   const now = new Date();
   const datePrefix = now.toISOString().slice(0, 10);
   const filename = `${datePrefix}-${slugifyTitle(title)}.md`;
-  const noteContent = `# ${title}\n\n_Opgeslagen op ${formatTimestamp(now)}_\n\n${body}\n`;
+  const tagLine = tags.length ? `\n\n${tags.join(" ")}\n` : "";
+  const noteContent = `# ${title}\n\n_Opgeslagen op ${formatTimestamp(now)}_\n\n${body}\n${tagLine}`;
 
   try {
     const validPath = await filesystem.validatePath(filename);
     await filesystem.writeFileContent(validPath, noteContent);
+    const tagConfirm = tags.length ? `\n\n${tags.join(" ")}` : "";
     return response(
       msgUUID,
-      `Opgeslagen in de vault: \`${path.basename(validPath)}\`\n\n**${title}**\n\n${body}`
+      `Opgeslagen in de vault: \`${path.basename(validPath)}\`\n\n**${title}**\n\n${body}${tagConfirm}`
     );
   } catch (e) {
     console.error(`[/vault] Write failed: ${e.message}`);
