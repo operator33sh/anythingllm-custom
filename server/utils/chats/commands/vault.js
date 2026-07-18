@@ -85,7 +85,7 @@ async function saveToVault(workspace, message, msgUUID, user = null, thread = nu
     user,
     workspace,
     thread,
-    messageLimit: 20,
+    messageLimit: 5,
   });
 
   const transcript = chatHistory
